@@ -1,0 +1,202 @@
+name: Allu Three Scripts
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: write
+
+# Do not add a concurrency block.
+# Multiple workflow runs must be allowed to overlap.
+
+jobs:
+  run-allu-scripts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check expiry dates
+        id: expiry
+        shell: bash
+        run: |
+          FIRST_EXPIRY_DATE="2026-07-31"
+          SECOND_EXPIRY_DATE="2026-07-31"
+          THIRD_EXPIRY_DATE="2026-07-31"
+          TODAY=$(TZ=Asia/Kolkata date +%F)
+
+          echo "Today in IST: $TODAY"
+          echo "First script expiry:  $FIRST_EXPIRY_DATE"
+          echo "Second script expiry: $SECOND_EXPIRY_DATE"
+          echo "Third script expiry:  $THIRD_EXPIRY_DATE"
+
+          if [[ "$TODAY" > "$FIRST_EXPIRY_DATE" ]]; then
+            echo "first_allowed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "first_allowed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          if [[ "$TODAY" > "$SECOND_EXPIRY_DATE" ]]; then
+            echo "second_allowed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "second_allowed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          if [[ "$TODAY" > "$THIRD_EXPIRY_DATE" ]]; then
+            echo "third_allowed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "third_allowed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          if [[ "$TODAY" > "$FIRST_EXPIRY_DATE" && \
+                "$TODAY" > "$SECOND_EXPIRY_DATE" && \
+                "$TODAY" > "$THIRD_EXPIRY_DATE" ]]; then
+            echo "any_allowed=false" >> "$GITHUB_OUTPUT"
+            echo "All three scripts have expired."
+          else
+            echo "any_allowed=true" >> "$GITHUB_OUTPUT"
+            echo "At least one script is allowed to run."
+          fi
+
+      - name: Checkout Repository
+        if: steps.expiry.outputs.any_allowed == 'true'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        if: steps.expiry.outputs.any_allowed == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install Python Dependencies
+        if: steps.expiry.outputs.any_allowed == 'true'
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests curl-cffi
+
+      - name: Configure Git User
+        if: steps.expiry.outputs.any_allowed == 'true'
+        shell: bash
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email \
+            "github-actions[bot]@users.noreply.github.com"
+          git config --global pull.rebase true
+
+      - name: Install and Setup Cloudflare WARP
+        if: steps.expiry.outputs.any_allowed == 'true'
+        shell: bash
+        run: |
+          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
+            | sudo gpg --yes --dearmor \
+              --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+
+          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" \
+            | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
+
+          sudo apt-get update
+          sudo apt-get install -y cloudflare-warp
+
+          warp-cli --accept-tos registration new
+          warp-cli --accept-tos mode proxy
+          warp-cli --accept-tos connect
+
+          sleep 5
+          warp-cli --accept-tos status
+
+          curl -x socks5://127.0.0.1:40000 \
+            https://1.1.1.1/cdn-cgi/trace \
+            | grep warp \
+            || echo "WARP test failed, but continuing."
+
+      - name: Run all three scripts and trigger next workflow
+        if: steps.expiry.outputs.any_allowed == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FIRST_ALLOWED: ${{ steps.expiry.outputs.first_allowed }}
+          SECOND_ALLOWED: ${{ steps.expiry.outputs.second_allowed }}
+          THIRD_ALLOWED: ${{ steps.expiry.outputs.third_allowed }}
+        run: |
+          set -uo pipefail
+
+          FIRST_EXPIRY_DATE="2026-07-31"
+          SECOND_EXPIRY_DATE="2026-07-31"
+          THIRD_EXPIRY_DATE="2026-07-31"
+
+          PIDS=()
+
+          start_script() {
+            local script_name="$1"
+            local allowed="$2"
+
+            if [[ "$allowed" == "true" ]]; then
+              echo "Starting $script_name..."
+              python -u "$script_name" &
+              PIDS+=("$!")
+            else
+              echo "$script_name has expired and will not start."
+            fi
+          }
+
+          stop_scripts() {
+            echo "Stopping all active Python scripts..."
+
+            for pid in "${PIDS[@]}"; do
+              if kill -0 "$pid" 2>/dev/null; then
+                kill -TERM "$pid" 2>/dev/null || true
+              fi
+            done
+
+            sleep 10
+
+            for pid in "${PIDS[@]}"; do
+              if kill -0 "$pid" 2>/dev/null; then
+                kill -KILL "$pid" 2>/dev/null || true
+              fi
+            done
+          }
+
+          trap stop_scripts EXIT INT TERM
+
+          # These commands are launched one immediately after another,
+          # so all three scripts begin at practically the same moment.
+          start_script "1st_day_allu.py" "$FIRST_ALLOWED"
+          start_script "2nd_day_allu.py" "$SECOND_ALLOWED"
+          start_script "3rd_day_allu.py" "$THIRD_ALLOWED"
+
+          echo "Active Python process IDs: ${PIDS[*]}"
+          echo "The next workflow will be requested after 4 minutes."
+          sleep 240
+
+          TODAY=$(TZ=Asia/Kolkata date +%F)
+
+          if [[ "$TODAY" > "$FIRST_EXPIRY_DATE" && \
+                "$TODAY" > "$SECOND_EXPIRY_DATE" && \
+                "$TODAY" > "$THIRD_EXPIRY_DATE" ]]; then
+            echo "All expiry dates are over."
+            echo "The next workflow will not be started."
+          else
+            echo "Requesting the next workflow run..."
+
+            gh workflow run "${{ github.workflow }}" \
+              --repo "${{ github.repository }}" \
+              --ref "${{ github.ref_name }}"
+
+            echo "Next workflow requested successfully."
+          fi
+
+          echo "Current scripts will continue for 2 more minutes."
+          sleep 120
+
+          stop_scripts
+          trap - EXIT INT TERM
+
+          for pid in "${PIDS[@]}"; do
+            wait "$pid" 2>/dev/null || true
+          done
+
+          echo "Current six-minute script run completed."
